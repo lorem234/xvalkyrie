@@ -133,6 +133,8 @@ bool in_title(const void *address);
 // "image+0x...", "<dll>+0x..." or the address
 // the base of the title's image or DLL `address` is in, null for anything else
 void *title_image_base(const void *address);
+// Non-forwarded export of the main executable, with the given minimum readable size.
+const void *main_image_export(std::string_view symbol, std::size_t size);
 std::string guest_location(const void *address);
 // an export of a console system module from the title's system folder, mapping it on first
 // use; null without that folder or module

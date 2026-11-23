@@ -46,6 +46,7 @@ struct Guest {
     std::deque<TitleModule> modules; // dependencies before what needs them
     Resolver resolve;                // imports of the title's DLLs loaded while it runs
     const Registry *registry = nullptr;
+    const nlohmann::json *main_exports = nullptr;
     std::filesystem::path system_directory; // the console's System32 the title shipped with
     std::map<std::string, std::unique_ptr<std::string>> own_handles; // LoadLibrary of ours
     std::recursive_mutex loading;
@@ -899,6 +900,32 @@ void *detail::title_image_base(const void *address) {
     return title ? reinterpret_cast<void *>(title->base) : nullptr;
 }
 
+const void *detail::main_image_export(std::string_view symbol, std::size_t size) {
+    if (!guest || !guest->main_exports)
+        return nullptr;
+    for (const auto &entry : *guest->main_exports) {
+        if (entry.contains("unused") || entry.contains("forwarder"))
+            continue;
+        for (const auto &name : entry.at("names")) {
+            if (name.get_ref<const std::string &>() != symbol)
+                continue;
+            const auto rva = entry.at("rva").get<std::uint64_t>();
+            if (rva >= guest->size || size > guest->size - rva)
+                return nullptr;
+            const auto address = guest->base + rva;
+            MEMORY_BASIC_INFORMATION info{};
+            auto *const data = reinterpret_cast<const void *>(address);
+            if (!VirtualQuery(data, &info, sizeof info) || info.State != MEM_COMMIT ||
+                (info.Protect & (PAGE_NOACCESS | PAGE_GUARD | PAGE_EXECUTE)) ||
+                size > info.RegionSize -
+                           (address - reinterpret_cast<std::uintptr_t>(info.BaseAddress)))
+                return nullptr;
+            return data;
+        }
+    }
+    return nullptr;
+}
+
 void *detail::runtime_override(std::string_view symbol) {
     for (const auto &entry : overrides)
         if (entry.symbol == symbol)
@@ -1008,6 +1035,8 @@ std::uint32_t execute(const std::filesystem::path &path, std::span<const std::ui
         throw std::runtime_error("Cannot protect import stubs");
     state.base = image.guest_base();
     state.size = layout.at("size_of_image");
+    if (contents.contains("exports"))
+        state.main_exports = &contents.at("exports").at("symbols");
     if (contents.contains("tls"))
         install_static_tls(contents.at("tls"), state.base, pe.at("image_base"), true);
 

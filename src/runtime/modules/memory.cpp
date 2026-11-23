@@ -394,6 +394,26 @@ void *commit_title_memory(void *address, std::size_t size) {
     return virtual_alloc(address, size, MEM_COMMIT, PAGE_READWRITE);
 }
 
+XMemAllocationHooks title_allocation_hooks() {
+    const auto *const exported =
+        detail::main_image_export("__XMemAllocationHooks__", sizeof(XMemAllocationHooks));
+    if (!exported)
+        return {};
+    XMemAllocationHooks hooks{};
+    std::memcpy(&hooks, exported, sizeof hooks);
+    const auto is_callback = [](const void *address) {
+        MEMORY_BASIC_INFORMATION info{};
+        constexpr DWORD executable = PAGE_EXECUTE | PAGE_EXECUTE_READ;
+        return detail::in_title(address) && VirtualQuery(address, &info, sizeof info) &&
+               info.State == MEM_COMMIT && (info.Protect & executable) &&
+               !(info.Protect & PAGE_GUARD);
+    };
+    return is_callback(reinterpret_cast<const void *>(hooks.allocate)) &&
+                   is_callback(reinterpret_cast<const void *>(hooks.release))
+               ? hooks
+               : XMemAllocationHooks{};
+}
+
 void *allocate_aligned(std::size_t size, std::uint64_t alignment, void *address) {
     MEM_ADDRESS_REQUIREMENTS requirements{};
     requirements.Alignment = address || alignment <= page ? 0 : alignment;

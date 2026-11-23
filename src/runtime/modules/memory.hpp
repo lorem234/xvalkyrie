@@ -18,6 +18,11 @@ void install_xmem(Registry &registry);
 void *allocate_aligned(std::size_t size, std::uint64_t alignment, void *address);
 // VirtualAlloc(MEM_COMMIT) as a title's own call does it, physical page reservations included
 void *commit_title_memory(void *address, std::size_t size);
+struct XMemAllocationHooks {
+    void *(WINAPI *allocate)(SIZE_T, ULONGLONG);
+    void(WINAPI *release)(void *, ULONGLONG);
+};
+XMemAllocationHooks title_allocation_hooks();
 // D3DAllocateGraphicsMemory and D3DFreeGraphicsMemory
 HRESULT WINAPI allocate_graphics_memory(SIZE_T size, UINT64 alignment, UINT64 address, UINT flags,
                                         void **result);

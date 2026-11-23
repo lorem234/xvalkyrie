@@ -3,6 +3,7 @@
 #include "runtime/modules/console_shader.hpp"
 #include "runtime/modules/d3d12x.hpp"
 #include "runtime/modules/d3d12x/internal.hpp"
+#include "runtime/modules/memory.hpp"
 #include "runtime/modules/placement.hpp"
 #include <algorithm>
 #include <array>
@@ -581,7 +582,9 @@ struct ShadowHeap {
     std::uint64_t gpu; // the host's GPU handle of the start, for a shader-visible heap
     UINT host_stride;
     void *owner; // the heap the title holds
+    decltype(XMemAllocationHooks::release) release;
 };
+constexpr ULONGLONG descriptor_memory_attributes = 4;
 // The console's descriptor sizes, which titles also have compiled in: the device's inline
 // methods copy descriptors of these sizes themselves
 UINT console_stride(D3D12_DESCRIPTOR_HEAP_TYPE type) {
@@ -717,27 +720,62 @@ void decode_written(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
                                              D3D12_CPU_DESCRIPTOR_HANDLE);
     original<Create>(heap->device, 17)(heap->device, &view, host_handle(handle));
 }
-void register_shadow(ID3D12Device *device, void *heap, const D3D12_DESCRIPTOR_HEAP_DESC &desc,
+bool writable_descriptors(std::uintptr_t address, std::size_t bytes) {
+    while (bytes) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<void *>(address), &info, sizeof info) ||
+            info.State != MEM_COMMIT || !(info.Protect & (PAGE_READWRITE | PAGE_WRITECOPY)) ||
+            (info.Protect & PAGE_GUARD))
+            return false;
+        const auto available =
+            info.RegionSize - (address - reinterpret_cast<std::uintptr_t>(info.BaseAddress));
+        if (available >= bytes)
+            return true;
+        address += available;
+        bytes -= available;
+    }
+    return true;
+}
+bool register_shadow(ID3D12Device *device, void *heap, const D3D12_DESCRIPTOR_HEAP_DESC &desc,
                      D3D12_CPU_DESCRIPTOR_HANDLE host, std::uint64_t gpu) {
     const UINT stride = console_stride(desc.Type);
-    auto *const memory = low_memory(std::size_t{desc.NumDescriptors} * stride);
+    const std::size_t bytes = std::size_t{desc.NumDescriptors} * stride;
+    const bool shader_visible = (desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0;
+    const auto hooks = console == Target::scarlett && shader_visible &&
+                               desc.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
+                           ? title_allocation_hooks()
+                           : XMemAllocationHooks{};
+    auto *const memory =
+        hooks.allocate ? hooks.allocate(bytes, descriptor_memory_attributes) : low_memory(bytes);
     if (!memory) {
-        std::fprintf(stderr, "[Runtime] no memory below 4 GiB for a descriptor heap\n");
-        return;
+        std::fprintf(stderr, "[Runtime] no guest memory for a descriptor heap\n");
+        return false;
     }
     const auto base = reinterpret_cast<std::uintptr_t>(memory);
-    const std::lock_guard lock(shadow_mutex);
-    shadow_heaps[base] = {base,
-                          base + std::size_t{desc.NumDescriptors} * stride,
-                          host,
-                          stride,
-                          desc.Type,
-                          device,
-                          (desc.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0,
-                          gpu,
-                          device->GetDescriptorHandleIncrementSize(desc.Type),
-                          heap};
-    shadow_of[heap] = base;
+    if (!hooks.allocate || (base % stride == 0 && writable_descriptors(base, bytes))) {
+        const auto end = base + bytes;
+        const std::lock_guard lock(shadow_mutex);
+        const auto next = shadow_heaps.lower_bound(base);
+        if ((next == shadow_heaps.end() || end <= next->second.base) &&
+            (next == shadow_heaps.begin() || std::prev(next)->second.end <= base)) {
+            shadow_heaps.emplace(
+                base, ShadowHeap{base, end, host, stride, desc.Type, device, shader_visible, gpu,
+                                 device->GetDescriptorHandleIncrementSize(desc.Type), heap,
+                                 hooks.release});
+            shadow_of.emplace(heap, base);
+            if (hooks.allocate)
+                std::fprintf(stderr,
+                             "[Runtime] descriptor heap uses the title's memory (%u descriptors)\n",
+                             desc.NumDescriptors);
+            return true;
+        }
+    }
+    if (hooks.release)
+        hooks.release(memory, descriptor_memory_attributes);
+    else
+        VirtualFree(memory, 0, MEM_RELEASE);
+    std::fprintf(stderr, "[Runtime] invalid guest memory range for a descriptor heap\n");
+    return false;
 }
 // Before the GPU runs: what the title wrote straight into a shader-visible heap since last
 // time, read from the pages written to
@@ -746,7 +784,9 @@ void decode_written_heaps() {
     {
         const std::lock_guard lock(shadow_mutex);
         for (const auto &[base, heap] : shadow_heaps)
-            if (heap.shader_visible && heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+            // Title-owned mappings do not have write-watch. Decode those via their bound tables.
+            if (!heap.release && heap.shader_visible &&
+                heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
                 heaps.push_back(heap);
     }
     std::vector<void *> pages(4096);
@@ -839,15 +879,21 @@ ULONG STDMETHODCALLTYPE heap_release(void *self) {
             const std::lock_guard lock(heap_proxy_mutex);
             heap_proxies.erase(proxy);
         }
-        // its shadow goes with it: the host's descriptors it stood for are no more
+        ShadowHeap shadow{};
         {
             const std::lock_guard lock(shadow_mutex);
             if (const auto found = shadow_of.find(proxy); found != shadow_of.end()) {
-                VirtualFree(reinterpret_cast<void *>(found->second), 0, MEM_RELEASE);
-                shadow_heaps.erase(found->second);
+                shadow = shadow_heaps.at(found->second);
+                shadow_heaps.erase(shadow.base);
                 shadow_of.erase(found);
                 ++shadows_released;
             }
+        }
+        if (auto *const memory = reinterpret_cast<void *>(shadow.base)) {
+            if (shadow.release)
+                shadow.release(memory, descriptor_memory_attributes);
+            else
+                VirtualFree(memory, 0, MEM_RELEASE);
         }
         proxy->host->Release();
         delete proxy;
@@ -1521,12 +1567,16 @@ HRESULT STDMETHODCALLTYPE create_descriptor_heap(ID3D12Device *self,
                          ? host_heap_object->GetGPUDescriptorHandleForHeapStart().ptr
                          : 0;
     auto *const proxy = new HeapProxy{heap_vtable.data(), host_heap_object, 1};
+    if (!register_shadow(self, proxy, *desc, host, gpu)) {
+        heap_release(proxy);
+        *heap = nullptr;
+        return E_OUTOFMEMORY;
+    }
     {
         const std::lock_guard lock(heap_proxy_mutex);
         heap_proxies.insert(proxy);
     }
     *heap = proxy;
-    register_shadow(self, proxy, *desc, host, gpu);
     return result;
 }
 HRESULT STDMETHODCALLTYPE create_committed_resource(ID3D12Device *, const D3D12_HEAP_PROPERTIES *,
