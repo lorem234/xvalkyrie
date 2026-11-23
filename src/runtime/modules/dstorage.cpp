@@ -4,6 +4,7 @@
 #include "runtime/modules/kernel.hpp"
 #include "runtime/modules/placement.hpp"
 #include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -28,10 +29,14 @@ constexpr GUID file_iid{
     0x43704f9f, 0x27c6, 0x4a9f, {0x88, 0x15, 0xd1, 0x65, 0x27, 0x89, 0x4d, 0xf4}};
 constexpr GUID factory_iid{
     0xfb3b54ac, 0xbf82, 0x463a, {0xb7, 0x77, 0x73, 0x19, 0x58, 0x37, 0x86, 0x4d}};
+constexpr GUID factory_x2_iid{
+    0x62959d11, 0xd45f, 0x4884, {0xa0, 0xa3, 0xf7, 0x86, 0x2e, 0xa2, 0x43, 0xae}};
 constexpr GUID status_iid{
     0xcd66d752, 0x2786, 0x44f7, {0x90, 0x70, 0xe2, 0xa6, 0xfd, 0xad, 0x3f, 0x1b}};
 constexpr GUID queue_iid{
     0xa3f6649a, 0x8c2c, 0x4b3a, {0x8b, 0x6e, 0x10, 0x18, 0x6a, 0x04, 0xb9, 0xbc}};
+constexpr GUID queue_x2_iid{
+    0x3c02cb0c, 0xc050, 0x4195, {0x99, 0xa1, 0xa1, 0xce, 0x94, 0xba, 0x33, 0xc5}};
 
 template <class Interface> class Object : public Interface {
   public:
@@ -80,6 +85,31 @@ struct QueueInfo {
     QueueDesc desc;
     UINT16 empty_slots, until_submit;
 };
+// IDStorageFactoryX2 adds a descriptor with one 64-bit options word after the base fields.
+constexpr UINT64 disable_auto_submit = 1;
+struct QueueDesc1 {
+    QueueDesc base;
+    UINT64 options;
+};
+struct QueueInfo1 {
+    QueueDesc1 desc;
+    UINT16 empty_slots, until_submit;
+};
+static_assert(offsetof(QueueDesc1, options) == 24 && offsetof(QueueInfo1, empty_slots) == 32);
+
+struct PriorityStats {
+    UINT32 current_queues, max_queues, total_queues, total_status, total_fences, pending_requests,
+        total_requests;
+    UINT64 source_bytes, destination_bytes;
+};
+struct StorageStats {
+    PriorityStats priorities[4];
+    UINT8 current_disks, max_disks;
+    UINT32 total_disks, pending_reads, total_reads, read_retries, read_errors,
+        pending_decompressions, total_decompressions, decompression_errors, staging_stalls,
+        current_files, max_files, total_files, current_memory, max_memory, errors;
+};
+static_assert(sizeof(PriorityStats) == 48 && sizeof(StorageStats) == 256);
 struct Request {
     UINT64 options; // bit 0 zlib, bits 1 to 4 BCPack, bit 21 destination in pages, bit 22
                     // source in memory, bit 23 source in pages
@@ -109,6 +139,8 @@ struct QueueInterface : IUnknown {
     virtual HANDLE GetErrorEvent() = 0;
     virtual void RetrieveErrorRecord(ErrorRecord *record) = 0;
     virtual void Query(QueueInfo *info) = 0;
+    virtual void EnqueueSetEvent(HANDLE event) = 0;
+    virtual void Query1(QueueInfo1 *info) = 0;
 };
 struct FactoryInterface : IUnknown {
     virtual HRESULT CreateQueue(const QueueDesc *desc, REFIID iid, void **queue) = 0;
@@ -118,6 +150,8 @@ struct FactoryInterface : IUnknown {
     virtual HRESULT SetCpuAffinity(UINT64 affinity) = 0;
     virtual void SetDebugFlags(UINT32 flags) = 0;
     virtual HRESULT SetStagingBufferSize(UINT32 size) = 0;
+    virtual void GetStats(StorageStats *stats) = 0;
+    virtual HRESULT CreateQueue1(const QueueDesc1 *desc, REFIID iid, void **queue) = 0;
 };
 
 class File final : public Object<FileInterface> {
@@ -224,17 +258,35 @@ HRESULT read(const Request &request) {
 
 class Queue final : public Object<QueueInterface> {
   public:
-    explicit Queue(const QueueDesc &desc)
-        : Object(queue_iid), desc_(desc), name_(desc.name ? desc.name : ""),
+    Queue(const QueueDesc &desc, UINT64 options)
+        : Object(queue_iid), desc_(desc), options_(options), name_(desc.name ? desc.name : ""),
           error_(CreateEventW(nullptr, TRUE, FALSE, nullptr)) {
         desc_.name = name_.c_str();
     }
-    ~Queue() override { CloseHandle(error_); }
+    ~Queue() override {
+        for (auto &entry : pending_) {
+            if (const auto *request = std::get_if<Request>(&entry)) {
+                if (!(request->options & 1ull << 22) && request->source)
+                    static_cast<IUnknown *>(request->source)->Release();
+            } else if (const auto *mark = std::get_if<Mark>(&entry)) {
+                mark->status->Release();
+            } else if (const auto *signal = std::get_if<Signal>(&entry)) {
+                signal->fence->Release();
+            } else if (const auto *event = std::get_if<Event>(&entry)) {
+                CloseHandle(event->handle);
+            }
+        }
+        CloseHandle(error_);
+    }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override {
+        return Object::QueryInterface(iid == queue_x2_iid ? queue_iid : iid, object);
+    }
     void EnqueueRequest(const Request *request) override {
         if (!request)
             return;
         {
-            const std::lock_guard lock(mutex_);
+            std::unique_lock lock(mutex_);
+            wait_for_space(lock);
             // the file is held until the request is done
             if (!(request->options & 1ull << 22) && request->source)
                 static_cast<IUnknown *>(request->source)->AddRef();
@@ -246,9 +298,10 @@ class Queue final : public Object<QueueInterface> {
         if (!status)
             return;
         status->AddRef();
-        static_cast<Status *>(status)->pending(index);
         {
-            const std::lock_guard lock(mutex_);
+            std::unique_lock lock(mutex_);
+            wait_for_space(lock);
+            static_cast<Status *>(status)->pending(index);
             pending_.emplace_back(Mark{static_cast<Status *>(status), index});
         }
         submit_when_full();
@@ -258,19 +311,21 @@ class Queue final : public Object<QueueInterface> {
             return;
         fence->AddRef();
         {
-            const std::lock_guard lock(mutex_);
+            std::unique_lock lock(mutex_);
+            wait_for_space(lock);
             pending_.emplace_back(Signal{fence, value});
         }
         submit_when_full();
     }
     void Submit() override {
+        // Take submissions in queue order, including when more than one thread submits.
+        const std::lock_guard running(running_);
         std::vector<Entry> work;
         {
             const std::lock_guard lock(mutex_);
             work.swap(pending_);
         }
-        // one submission at a time, so that marks follow the requests before them
-        const std::lock_guard running(running_);
+        space_.notify_all();
         HRESULT since_mark = S_OK;
         for (auto &entry : work) {
             if (auto *const request = std::get_if<Request>(&entry)) {
@@ -301,6 +356,9 @@ class Queue final : public Object<QueueInterface> {
             } else if (auto *const signal = std::get_if<Signal>(&entry)) {
                 signal->fence->Signal(signal->value);
                 signal->fence->Release();
+            } else if (auto *const event = std::get_if<Event>(&entry)) {
+                SetEvent(event->handle);
+                CloseHandle(event->handle);
             }
         }
     }
@@ -314,6 +372,7 @@ class Queue final : public Object<QueueInterface> {
                 static_cast<IUnknown *>(request->source)->Release();
             return true;
         });
+        space_.notify_all();
     }
     void Close() override { Submit(); }
     HANDLE GetErrorEvent() override { return error_; }
@@ -337,6 +396,30 @@ class Queue final : public Object<QueueInterface> {
         *info = {desc_, static_cast<UINT16>(desc_.capacity - used),
                  static_cast<UINT16>(desc_.capacity / 2 > used ? desc_.capacity / 2 - used : 0)};
     }
+    void EnqueueSetEvent(HANDLE event) override {
+        HANDLE copy = nullptr;
+        if (!DuplicateHandle(GetCurrentProcess(), event, GetCurrentProcess(), &copy, 0, FALSE,
+                             DUPLICATE_SAME_ACCESS))
+            return;
+        {
+            std::unique_lock lock(mutex_);
+            wait_for_space(lock);
+            pending_.emplace_back(Event{copy});
+        }
+        submit_when_full();
+    }
+    void Query1(QueueInfo1 *info) override {
+        if (!info)
+            return;
+        const std::lock_guard lock(mutex_);
+        const auto used = std::min(pending_.size(), usable_slots());
+        const auto threshold = static_cast<std::size_t>(desc_.capacity / 2);
+        const auto until_submit =
+            options_ & disable_auto_submit || used >= threshold ? 0 : threshold - used;
+        *info = {{desc_, options_},
+                 static_cast<UINT16>(usable_slots() - used),
+                 static_cast<UINT16>(until_submit)};
+    }
 
   private:
     struct Mark {
@@ -347,9 +430,19 @@ class Queue final : public Object<QueueInterface> {
         ID3D12Fence *fence;
         UINT64 value;
     };
-    using Entry = std::variant<Request, Mark, Signal>;
+    struct Event {
+        HANDLE handle;
+    };
+    using Entry = std::variant<Request, Mark, Signal, Event>;
+    std::size_t usable_slots() const { return desc_.capacity > 1 ? desc_.capacity - 1 : 0; }
+    void wait_for_space(std::unique_lock<std::mutex> &lock) {
+        if (options_ & disable_auto_submit)
+            space_.wait(lock, [this] { return pending_.size() < usable_slots(); });
+    }
     // a queue submits itself when half of it is taken
     void submit_when_full() {
+        if (options_ & disable_auto_submit)
+            return;
         bool full;
         {
             const std::lock_guard lock(mutex_);
@@ -359,9 +452,11 @@ class Queue final : public Object<QueueInterface> {
             Submit();
     }
     QueueDesc desc_;
+    UINT64 options_;
     std::string name_;
     HANDLE error_;
     std::mutex mutex_, running_;
+    std::condition_variable space_;
     std::vector<Entry> pending_;
     UINT32 failures_ = 0;
     HRESULT first_failure_ = S_OK;
@@ -370,13 +465,13 @@ class Queue final : public Object<QueueInterface> {
 class Factory final : public Object<FactoryInterface> {
   public:
     Factory() : Object(factory_iid) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override {
+        return Object::QueryInterface(iid == factory_x2_iid ? factory_iid : iid, object);
+    }
     HRESULT CreateQueue(const QueueDesc *desc, REFIID iid, void **queue) override {
         if (!desc || !queue)
             return E_POINTER;
-        auto *const made = new Queue(*desc);
-        const auto result = made->QueryInterface(iid, queue);
-        made->Release();
-        return result;
+        return make_queue(*desc, 0, iid, queue);
     }
     HRESULT OpenFile(const WCHAR *path, REFIID iid, void **file) override {
         if (!path || !file)
@@ -414,6 +509,27 @@ class Factory final : public Object<FactoryInterface> {
     HRESULT SetCpuAffinity(UINT64) override { return S_OK; }
     void SetDebugFlags(UINT32) override {}
     HRESULT SetStagingBufferSize(UINT32) override { return S_OK; }
+    void GetStats(StorageStats *stats) override {
+        // The shim does its work with Win32 I/O and has no console storage telemetry.
+        if (stats)
+            *stats = {};
+    }
+    HRESULT CreateQueue1(const QueueDesc1 *desc, REFIID iid, void **queue) override {
+        if (!desc || !queue)
+            return E_POINTER;
+        *queue = nullptr;
+        if (desc->base.capacity < 2 || (desc->options & ~disable_auto_submit))
+            return E_INVALIDARG;
+        return make_queue(desc->base, desc->options, iid, queue);
+    }
+
+  private:
+    static HRESULT make_queue(const QueueDesc &desc, UINT64 options, REFIID iid, void **queue) {
+        auto *const made = new Queue(desc, options);
+        const auto result = made->QueryInterface(iid, queue);
+        made->Release();
+        return result;
+    }
 };
 
 HRESULT WINAPI get_factory(const GUID *iid, void **factory) {
