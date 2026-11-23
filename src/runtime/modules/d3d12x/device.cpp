@@ -750,10 +750,17 @@ void decode_written_heaps() {
                 heaps.push_back(heap);
     }
     std::vector<void *> pages(4096);
+    static const DWORD page_size = [] {
+        SYSTEM_INFO system{};
+        GetSystemInfo(&system);
+        return system.dwPageSize;
+    }();
     for (const auto &heap : heaps) {
+        const auto bytes = ((heap.end - heap.base) + 0xffff) & ~std::uintptr_t{0xffff};
+        if (const auto page_count = bytes / page_size; page_count > pages.size())
+            pages.resize(page_count);
         ULONG_PTR count = pages.size();
         ULONG size = 0;
-        const auto bytes = ((heap.end - heap.base) + 0xffff) & ~std::uintptr_t{0xffff};
         if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, reinterpret_cast<void *>(heap.base), bytes,
                           pages.data(), &count, &size) != 0)
             continue;
@@ -4202,9 +4209,24 @@ HRESULT WINAPI xbox_create_device(void *, const UINT *parameters, REFIID iid, vo
             dred->Release();
         }
     }
+    const auto *const warp = std::getenv("XV_D3D_WARP");
+    const bool use_warp = warp && std::strcmp(warp, "1") == 0;
+    Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+    HRESULT result = E_NOTIMPL;
+    if (use_warp) {
+        Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
+        result = CreateDXGIFactory1(IID_PPV_ARGS(factory.GetAddressOf()));
+        if (SUCCEEDED(result))
+            result = factory->EnumWarpAdapter(IID_PPV_ARGS(adapter.GetAddressOf()));
+        if (FAILED(result)) {
+            std::fprintf(stderr, "[Runtime] Direct3D 12 WARP adapter unavailable: 0x%08lx\n",
+                         static_cast<unsigned long>(result));
+            return result;
+        }
+    }
     ID3D12Device *host = nullptr;
-    const auto result =
-        create ? create(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host)) : E_NOTIMPL;
+    result =
+        create ? create(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host)) : E_NOTIMPL;
     if (SUCCEEDED(result)) {
         d3d12_device = host;
         graphics::drawing_with("Direct3D 12");
@@ -4212,8 +4234,9 @@ HRESULT WINAPI xbox_create_device(void *, const UINT *parameters, REFIID iid, vo
     if (ID3D12InfoQueue *queue = nullptr;
         SUCCEEDED(result) && SUCCEEDED(host->QueryInterface(IID_PPV_ARGS(&queue))))
         debug_messages = queue;
-    std::fprintf(stderr, "[Runtime] Direct3D 12 device for an %s title on the host: 0x%08lx\n",
-                 std::string(target_name(console)).c_str(), static_cast<unsigned long>(result));
+    std::fprintf(stderr, "[Runtime] Direct3D 12 device for an %s title on the host%s: 0x%08lx\n",
+                 std::string(target_name(console)).c_str(), use_warp ? " (WARP software)" : "",
+                 static_cast<unsigned long>(result));
     std::fflush(stderr);
     if (FAILED(result))
         return result;
