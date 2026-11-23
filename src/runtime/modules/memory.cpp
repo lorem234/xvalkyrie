@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <string_view>
@@ -24,6 +25,7 @@ constexpr std::uintptr_t page = 1 << 16;
 constexpr std::uint64_t physical_size = 16ull << 30;
 constexpr DWORD allocation_types =
     MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN | MEM_WRITE_WATCH | MEM_RESET_UNDO;
+constexpr DWORD placeholder_types = MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER;
 constexpr DWORD protections = 0xff | PAGE_GUARD | PAGE_NOCACHE | PAGE_WRITECOMBINE;
 
 struct Mapping {
@@ -115,22 +117,59 @@ void *reserve(void *address, std::uintptr_t size, DWORD type) {
     auto &state = physical();
     if (!state.section)
         return nullptr;
+    if (!size || size > std::numeric_limits<std::uintptr_t>::max() - (page - 1)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    const bool replacing = (type & MEM_REPLACE_PLACEHOLDER) != 0;
+    if (replacing &&
+        (!address || (reinterpret_cast<std::uintptr_t>(address) | size) & (page - 1))) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
     size = (size + page - 1) & ~(page - 1);
     MEM_ADDRESS_REQUIREMENTS requirements{};
     requirements.Alignment = type & mem_4mb_pages && !address ? 4u << 20 : 0;
     MEM_EXTENDED_PARAMETER parameter{};
     parameter.Type = MemExtendedParameterAddressRequirements;
     parameter.Pointer = &requirements;
-    auto *const base =
-        VirtualAlloc2(GetCurrentProcess(), address, size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
-                      PAGE_NOACCESS, &parameter, 1);
+    const std::lock_guard lock(state.mutex);
+    if (replacing) {
+        std::uintptr_t existing_base = 0;
+        if (reservation_at(state, reinterpret_cast<std::uintptr_t>(address), &existing_base)) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return nullptr;
+        }
+    }
+    // A physical reservation replaces a guest placeholder with 64 KiB placeholder pieces so
+    // MapViewOfFile3 can map physical pages into them later. Let Windows validate that the
+    // supplied address and size describe one whole placeholder before splitting it.
+    const DWORD flags =
+        MEM_RESERVE | (replacing ? MEM_REPLACE_PLACEHOLDER : MEM_RESERVE_PLACEHOLDER);
+    auto *const base = VirtualAlloc2(GetCurrentProcess(), address, size, flags, PAGE_NOACCESS,
+                                     replacing ? nullptr : &parameter, replacing ? 0 : 1);
     if (!base)
         return nullptr;
+    if (replacing && !VirtualFree(base, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+        const auto error = GetLastError();
+        VirtualFree(base, 0, MEM_RELEASE);
+        SetLastError(error);
+        return nullptr;
+    }
     const auto start = reinterpret_cast<std::uintptr_t>(base);
-    for (std::uintptr_t offset = 0; offset + page < size; offset += page)
-        VirtualFree(reinterpret_cast<void *>(start + offset), page,
-                    MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
-    const std::lock_guard lock(state.mutex);
+    for (std::uintptr_t offset = 0; offset + page < size; offset += page) {
+        if (VirtualFree(reinterpret_cast<void *>(start + offset), page,
+                        MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))
+            continue;
+        const auto error = GetLastError();
+        if (replacing && offset)
+            VirtualFree(base, size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+        if (!replacing)
+            for (std::uintptr_t piece = 0; piece <= offset; piece += page)
+                VirtualFree(reinterpret_cast<void *>(start + piece), 0, MEM_RELEASE);
+        SetLastError(error);
+        return nullptr;
+    }
     state.reservations[start] = {size, {}};
     return base;
 }
@@ -158,21 +197,34 @@ bool commit(std::uintptr_t address, std::uintptr_t size, DWORD protect) {
     return true;
 }
 
+BOOL WINAPI virtual_free_ex(HANDLE process, void *address, SIZE_T size, DWORD type);
+
 void *WINAPI virtual_alloc_ex(HANDLE process, void *address, SIZE_T size, DWORD type,
                               DWORD protect) {
     if (GetProcessId(process) == GetCurrentProcessId()) {
-        if (type & MEM_RESERVE && type & page_sizes) {
+        if (type & MEM_RESERVE && type & page_sizes && !(type & MEM_RESERVE_PLACEHOLDER)) {
             auto *const base = reserve(address, size, type);
             if (base && type & MEM_COMMIT &&
-                !commit(reinterpret_cast<std::uintptr_t>(base), size, protect))
+                !commit(reinterpret_cast<std::uintptr_t>(base), size, protect)) {
+                const auto error = GetLastError();
+                const DWORD preserve =
+                    type & MEM_REPLACE_PLACEHOLDER ? MEM_PRESERVE_PLACEHOLDER : 0;
+                virtual_free_ex(process, base, preserve ? size : 0, MEM_RELEASE | preserve);
+                SetLastError(error);
                 return nullptr;
+            }
             return base;
         }
-        if (type & MEM_COMMIT && commit(reinterpret_cast<std::uintptr_t>(address), size, protect))
+        if (!(type & placeholder_types) && type & MEM_COMMIT &&
+            commit(reinterpret_cast<std::uintptr_t>(address), size, protect))
             return address;
     }
     const auto result =
-        VirtualAllocEx(process, address, size, type & allocation_types, protect & protections);
+        type & placeholder_types
+            ? VirtualAlloc2(process, address, size, type & (allocation_types | placeholder_types),
+                            protect & protections, nullptr, 0)
+            : VirtualAllocEx(process, address, size, type & allocation_types,
+                             protect & protections);
     if (!result && (type & ~(allocation_types | page_sizes) || protect & ~protections)) {
         const auto error = GetLastError();
         std::fprintf(stderr,
@@ -194,7 +246,9 @@ BOOL WINAPI virtual_free_ex(HANDLE process, void *address, SIZE_T size, DWORD ty
         std::uintptr_t base = 0;
         if (auto *const reservation = reservation_at(state, at, &base)) {
             const bool release = type & MEM_RELEASE;
-            if (release && at != base) {
+            const bool preserve = release && (type & MEM_PRESERVE_PLACEHOLDER);
+            if (release && (at != base || type & MEM_COALESCE_PLACEHOLDERS ||
+                            (preserve && size != reservation->size))) {
                 SetLastError(ERROR_INVALID_PARAMETER);
                 return FALSE;
             }
@@ -202,8 +256,15 @@ BOOL WINAPI virtual_free_ex(HANDLE process, void *address, SIZE_T size, DWORD ty
             for (auto view = at & ~(page - 1); view < end; view += page)
                 unmap(state, *reservation, view);
             if (release) {
-                for (auto piece = base; piece < end; piece += page)
-                    VirtualFree(reinterpret_cast<void *>(piece), 0, MEM_RELEASE);
+                if (preserve) {
+                    if (reservation->size > page &&
+                        !VirtualFree(address, reservation->size,
+                                     MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS))
+                        return FALSE;
+                } else {
+                    for (auto piece = base; piece < end; piece += page)
+                        VirtualFree(reinterpret_cast<void *>(piece), 0, MEM_RELEASE);
+                }
                 state.reservations.erase(base);
             }
             return TRUE;
