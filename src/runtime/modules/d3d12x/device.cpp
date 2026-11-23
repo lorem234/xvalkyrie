@@ -1626,6 +1626,18 @@ HRESULT STDMETHODCALLTYPE create_placed_resource_x(ID3D12Device *self, std::uint
                         console == Target::scarlett ? desc : nullptr);
     return result;
 }
+
+// The 0x20004 Scarlett ABI also has an address-based resource creation method at slot 133.
+// Its caller can leave the initial state unspecified (-1). Create the host buffer in COMMON
+// in that case, so it can be promoted on first use.
+HRESULT STDMETHODCALLTYPE create_placed_resource_later(ID3D12Device *self, std::uint64_t address,
+                                                       const D3D12_RESOURCE_DESC *desc, UINT state,
+                                                       const D3D12_CLEAR_VALUE *clear, REFIID iid,
+                                                       void **resource) {
+    const auto initial =
+        state == ~UINT{0} ? D3D12_RESOURCE_STATE_COMMON : static_cast<D3D12_RESOURCE_STATES>(state);
+    return create_placed_resource_x(self, address, desc, initial, clear, iid, resource);
+}
 // The console's GPU draws rectangle lists and quad lists (topology types 19 and 32, the
 // topologies 17 and 19). Here both are triangles: a quad list through indices of ours (see
 // draw_instanced), a rectangle list through a geometry shader of ours (see
@@ -3844,7 +3856,7 @@ void STDMETHODCALLTYPE gpu_hardware_configuration(void *, std::uint64_t *configu
     configuration[0] = static_cast<std::uint64_t>(frequency.QuadPart);
     configuration[1] = console == Target::scarlett ? 5 : 0;
 }
-constexpr std::size_t host_device_slots = 44, device_slots = 128;
+constexpr std::size_t host_device_slots = 44, device_slots = 134;
 template <std::size_t... Index>
 std::vector<std::pair<std::size_t, Slot>> unknown_device_methods(std::index_sequence<Index...>) {
     return {{host_device_slots + Index,
@@ -4273,6 +4285,8 @@ HRESULT WINAPI xbox_create_device(void *, const UINT *parameters, REFIID iid, vo
         overrides.push_back({86, reinterpret_cast<Slot>(&create_pipeline_state)});
         overrides.push_back({109, reinterpret_cast<Slot>(&create_committed_resource_2)});
         overrides.push_back({111, reinterpret_cast<Slot>(&create_feedback_view)});
+        if (parameters && *parameters == 0x20004)
+            overrides.push_back({133, reinterpret_cast<Slot>(&create_placed_resource_later)});
     }
     // all of the host's vtable, which its runtime calls past the desktop's first 44 too
     console_vtable<Family::device>(host, 96, device_slots, overrides);

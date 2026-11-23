@@ -10,6 +10,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   build:
+    if: github.ref != 'refs/heads/fix/directstorage-x2'
     strategy:
       fail-fast: false
       matrix:
@@ -20,17 +21,34 @@ jobs:
       - run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
       - run: cmake --build build --config ${{ matrix.config }} --parallel 3
       - run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
+  portable-test:
+    if: github.ref == 'refs/heads/fix/directstorage-x2'
+    runs-on: windows-2022
+    env:
+      SCCACHE_GHA_ENABLED: 'true'
+      SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: mozilla-actions/sccache-action@fd02668681acd5f960e1372061bee5e3e987195c # v0.0.11
+      - name: Build Release with Ninja and the compiler cache
+        shell: cmd
+        run: |
+          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64 || exit /b 1
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache || exit /b 1
+          cmake --build build --parallel 4 --target xvalkyrie xv_tests
+      - run: ctest --test-dir build --output-on-failure
+      - name: Assemble portable files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory portable | Out-Null
+          Copy-Item build/xvalkyrie.exe, build/xvboot.exe, LICENSE, README.md, THIRD-PARTY.md portable
       - name: Upload patched portable build
-        if: github.ref == 'refs/heads/fix/directstorage-x2' && matrix.config == 'Release'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: xvalkyrie-directstorage-x2-windows
-          path: |
-            build/Release/xvalkyrie.exe
-            build/Release/xvboot.exe
-            LICENSE
-            README.md
-            THIRD-PARTY.md
+          path: portable/
           if-no-files-found: error
   format:
     runs-on: windows-2022
